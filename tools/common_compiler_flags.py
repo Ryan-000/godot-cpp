@@ -88,6 +88,8 @@ def generate(env):
                 env.AppendUnique(CCFLAGS=["/GL"])
                 env.AppendUnique(ARFLAGS=["/LTCG"])
                 env.AppendUnique(LINKFLAGS=["/LTCG"])
+        if env["platform"] == "linux" or env.get("use_mingw", False):
+            env["ARFLAGS"] = "rcs"
     else:
         if env["debug_symbols"]:
             # Adding dwarf-4 explicitly makes stacktraces work with clang builds,
