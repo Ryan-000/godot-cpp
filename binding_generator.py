@@ -4,6 +4,7 @@ import json
 import re
 import shutil
 from pathlib import Path
+from contextlib import contextmanager
 
 
 def generate_mod_version(argcount, const=False, returns=False):
@@ -248,6 +249,9 @@ def _get_file_list(api, output_dir, headers=False, sources=False):
         struct_name = native_struct["name"]
         if struct_name == "ObjectID":
             continue
+        # Nested type will be generated in its parent's file.
+        if is_qualified_name_nested(struct_name):
+            continue
         snake_struct_name = camel_to_snake(struct_name)
 
         header_filename = include_gen_folder / "classes" / (snake_struct_name + ".hpp")
@@ -302,8 +306,42 @@ def _generate_bindings(api, api_filepath, use_template_get_node, bits="64", prec
     generate_version_header(api, target_dir)
     generate_global_constant_binds(api, target_dir)
     generate_builtin_bindings(api, target_dir, real_t + "_" + bits)
-    generate_engine_classes_bindings(api, target_dir, use_template_get_node)
+    # Right now the api doesn't nest structures under their parent types, so we will do it here.
+    nested_structs_by_parent = collect_nested_structs(api)
+    generate_engine_classes_bindings(api, target_dir, use_template_get_node, nested_structs_by_parent)
     generate_utility_functions(api, target_dir)
+
+
+def collect_nested_structs(api):
+    nested_by_parent = {}
+
+    for native_struct in api["native_structures"]:
+        name = native_struct["name"]
+        if not is_qualified_name_nested(name):
+            continue
+
+        parts = split_qualified_name(name)
+        if len(parts) != 2:
+            # We only support 1 level of nesting for now.
+            raise Exception(f"Type {name} has more than 1 level of nesting, which is not supported. (yet)")
+        parent = get_parent_class_name_of_structure(name)
+        nested_by_parent.setdefault(parent, []).append(native_struct)
+
+    return nested_by_parent
+
+def is_qualified_name_nested(qualified_name: str) -> bool:
+    return "::" in qualified_name
+
+def split_qualified_name(qualified_name: str) -> list[str]:
+    if "::" not in qualified_name:
+        return [qualified_name]
+    return qualified_name.split("::")
+
+def get_parent_class_name_of_structure(qualified_name: str) -> str:
+    return split_qualified_name(qualified_name)[0]
+
+def get_structure_name_without_parent(qualified_name: str) -> str:
+    return split_qualified_name(qualified_name)[-1]
 
 
 CLASS_ALIASES = {
@@ -319,6 +357,52 @@ engine_classes = {}
 native_structures = []
 
 singletons = []
+
+
+
+# Though this isn't used a lot at the moment,
+# im leaving it here because there does not appear to be a good way to indent the generated code at the moment.
+# using this would clean up things a lot.
+class CppCodeWriter:
+    def __init__(self, level =0, indent="\t"):
+        self._lines = []
+        self._level = level
+        self._indent = indent
+
+    def line(self, text=""):
+        if text:
+            self._lines.append(f"{self._indent * self._level}{text}")
+        else:
+            self._lines.append("")
+
+    @contextmanager
+    def indent(self):
+        self._level += 1
+        try:
+            yield
+        finally:
+            self._level -= 1
+
+    @contextmanager
+    def block(self, header, open_block, close_block):
+        self.line(f"{header} {open_block}")
+        with self.indent():
+            yield
+        self.line(close_block)
+
+    @contextmanager
+    def statement(self, header):
+        with self.block(header, open_block="{", close_block="}"):
+            yield
+
+    @contextmanager
+    def declaration(self, header):
+        with self.block(header, open_block="{", close_block="};"):
+            yield
+
+    def render(self):
+        return "\n".join(self._lines)
+
 
 
 def generate_builtin_bindings(api, output_dir, build_config):
@@ -1309,7 +1393,7 @@ def generate_builtin_class_source(builtin_api, size, used_classes, fully_used_cl
     return "\n".join(result)
 
 
-def generate_engine_classes_bindings(api, output_dir, use_template_get_node):
+def generate_engine_classes_bindings(api, output_dir, use_template_get_node, nested_structs_by_parent):
     global engine_classes
     global singletons
     global native_structures
@@ -1499,7 +1583,7 @@ def generate_engine_classes_bindings(api, output_dir, use_template_get_node):
 
         with header_filename.open("w+", encoding="utf-8") as header_file:
             header_file.write(
-                generate_engine_class_header(class_api, used_classes, fully_used_classes, use_template_get_node)
+                generate_engine_class_header(class_api, used_classes, fully_used_classes, use_template_get_node, nested_structs_by_parent)
             )
 
         with source_filename.open("w+", encoding="utf-8") as source_file:
@@ -1511,6 +1595,11 @@ def generate_engine_classes_bindings(api, output_dir, use_template_get_node):
         struct_name = native_struct["name"]
         if struct_name == "ObjectID":
             continue
+
+        # Nested type already generated elsewhere
+        if is_qualified_name_nested(struct_name):
+            continue
+        
         snake_struct_name = camel_to_snake(struct_name)
 
         header_filename = include_gen_folder / (snake_struct_name + ".hpp")
@@ -1539,22 +1628,19 @@ def generate_engine_classes_bindings(api, output_dir, use_template_get_node):
 
             for include in includes:
                 result.append(f"#include <{include}>")
-        else:
-            result.append("#include <godot_cpp/core/method_ptrcall.hpp>")
+        result.append("#include <godot_cpp/core/method_ptrcall.hpp>")
 
         result.append("")
 
         result.append("namespace godot {")
         result.append("")
+        
+        cw = CppCodeWriter()
+        _generate_structure(cw, native_struct, struct_name)
 
-        result.append(f"struct {struct_name} {{")
-        for field in native_struct["format"].split(";"):
-            if field != "":
-                result.append(f"\t{field};")
-        result.append("};")
-
-        result.append("")
-        result.append(f"GDVIRTUAL_NATIVE_PTR({struct_name});")
+        cw.line()
+        _generate_structure_registration(cw, struct_name)
+        result.append(cw.render())
         result.append("")
         result.append("} // namespace godot")
         result.append("")
@@ -1563,7 +1649,18 @@ def generate_engine_classes_bindings(api, output_dir, use_template_get_node):
             header_file.write("\n".join(result))
 
 
-def generate_engine_class_header(class_api, used_classes, fully_used_classes, use_template_get_node):
+def _generate_structure(writer: CppCodeWriter, native_struct, struct_name):
+	with writer.declaration(f"struct {struct_name}"):
+		for field in native_struct["format"].split(";"):
+			field = field.strip()
+			if field:
+				writer.line(f"{field};")
+
+def _generate_structure_registration(writer: CppCodeWriter, qualified_struct_name):
+    writer.line(f"GDVIRTUAL_NATIVE_PTR({qualified_struct_name});")
+
+
+def generate_engine_class_header(class_api, used_classes, fully_used_classes, use_template_get_node, nested_structs_by_parent):
     global singletons
     result = []
 
@@ -1583,6 +1680,8 @@ def generate_engine_class_header(class_api, used_classes, fully_used_classes, us
                 includes.append("godot_cpp/variant/typed_array.hpp")
             elif included == "TypedDictionary":
                 includes.append("godot_cpp/variant/typed_dictionary.hpp")
+            elif is_struct_type(included) and is_qualified_name_nested(included) and get_parent_class_name_of_structure(included) == class_name:
+                pass # Do nothing, this struct will be defined in this header.
             else:
                 includes.append(f"godot_cpp/{get_include_path(included)}")
 
@@ -1652,6 +1751,15 @@ def generate_engine_class_header(class_api, used_classes, fully_used_classes, us
                 value["type"] = "int"
             result.append(f"\tstatic const {value['type']} {value['name']} = {value['value']};")
         result.append("")
+    
+
+    structures = nested_structs_by_parent.get(class_name, [])
+    for struct_api in structures:
+        corrected_name = get_structure_name_without_parent(struct_api["name"])
+        cw = CppCodeWriter(1)
+        _generate_structure(cw, struct_api, corrected_name)
+        cw.line()
+        result.append(cw.render())
 
     if is_singleton:
         result.append(f"\tstatic {class_name} *get_singleton();")
@@ -1776,6 +1884,11 @@ def generate_engine_class_header(class_api, used_classes, fully_used_classes, us
 
     result.append("};")
     result.append("")
+
+    for struct_api in structures:
+        cw = CppCodeWriter()
+        _generate_structure_registration(cw, struct_api['name'])
+        result.append(cw.render())
 
     result.append("} // namespace godot")
     result.append("")
@@ -2378,6 +2491,8 @@ def get_include_path(type_name):
         base_dir = "variant"
     else:
         base_dir = "classes"
+    if is_struct_type(type_name) and is_qualified_name_nested(type_name):
+        type_name = get_parent_class_name_of_structure(type_name)
 
     return f"{base_dir}/{camel_to_snake(type_name)}.hpp"
 
@@ -2399,11 +2514,19 @@ def get_encoded_arg(arg_name, type_name, type_meta):
         # `{name}` is a C++ wrapper, it contains a field which is the object's pointer Godot expects.
         # We have to check `nullptr` because when the caller sends `nullptr`, the wrapper itself will be null.
         name = f"({name} != nullptr ? &{name}->_owner : nullptr)"
+    elif normalize_type_name(type_name) in native_structures:
+        name = f"(void*){name}"
     else:
         name = f"&{name}"
 
     return (result, name)
 
+def normalize_type_name(type_name):
+	type_name = correct_type(type_name)
+	type_name = type_name.replace("const ", "")
+	type_name = type_name.replace("&", "")
+	type_name = type_name.replace("*", "")
+	return type_name.strip()
 
 def make_signature(
     class_name, function_data, for_header=False, use_template_get_node=True, for_builtin=False, static=False
